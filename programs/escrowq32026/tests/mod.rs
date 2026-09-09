@@ -19,7 +19,13 @@ use {
     solana_transaction::Transaction,
 };
 
-// Setup function to initialize LiteSVM and create a payer keypair
+const DEPOSIT: u64 = 10_000_000;
+const RECEIVE: u64 = 10_000_000;
+const NEW_RECEIVE: u64 = 15_000_000;
+const EXPIRATION: i64 = 17780206209;
+const NEW_EXPIRATION: i64 = 18888888888;
+const SEED: u64 = 123;
+
 fn setup() -> (LiteSVM, Keypair) {
     let program_id = escrowq32026::id();
     let payer = Keypair::new();
@@ -30,143 +36,266 @@ fn setup() -> (LiteSVM, Keypair) {
     ));
     svm.add_program(program_id, bytes).unwrap();
     svm.airdrop(&payer.pubkey(), 1_000_000_000).unwrap();
-
-    // Return the LiteSVM instance and payer keypair
     (svm, payer)
 }
 
-#[test]
-fn test_make_and_refund() {
-    // Setup the test environment by initializing LiteSVM and creating a payer keypair
-    let (mut program, payer) = setup();
+fn send_ix(svm: &mut LiteSVM, ix: Instruction, signers: &[&Keypair]) {
+    let payer = signers[0];
+    let message = Message::new(&[ix], Some(&payer.pubkey()));
+    let recent_blockhash = svm.latest_blockhash();
+    let transaction = Transaction::new(signers, message, recent_blockhash);
+    let tx = svm.send_transaction(transaction).unwrap();
+    msg!("CUs Consumed: {}", tx.compute_units_consumed);
+    msg!("Tx Signature: {}", tx.signature);
+}
 
-    // Get the maker's public key from the payer keypair
-    let maker = payer.pubkey();
-
-    // Create two mints (Mint A and Mint B) with 6 decimal places and the maker as the authority
-    // This done using litesvm-token's CreateMint utility which creates the mint in the LiteSVM environment
-    let mint_a = CreateMint::new(&mut program, &payer)
-        .decimals(6)
-        .authority(&maker)
-        .send()
-        .unwrap();
-    msg!("Mint A: {}\n", mint_a);
-
-    let mint_b = CreateMint::new(&mut program, &payer)
-        .decimals(6)
-        .authority(&maker)
-        .send()
-        .unwrap();
-    msg!("Mint B: {}\n", mint_b);
-
-    // Create the maker's associated token account for Mint A
-    // This is done using litesvm-token's CreateAssociatedTokenAccount utility
-    let maker_ata_a = CreateAssociatedTokenAccount::new(&mut program, &payer, &mint_a)
-        .owner(&maker)
-        .send()
-        .unwrap();
-    msg!("Maker ATA A: {}\n", maker_ata_a);
-
-    // Derive the PDA for the escrow account using the maker's public key and a seed value
+fn make_escrow(
+    svm: &mut LiteSVM,
+    maker: &Keypair,
+    mint_a: Pubkey,
+    mint_b: Pubkey,
+    maker_ata_a: Pubkey,
+    seed: u64,
+    deposit: u64,
+    receive: u64,
+    expiration: i64,
+) -> (Pubkey, Pubkey) {
+    let maker_pk = maker.pubkey();
     let escrow = Pubkey::find_program_address(
-        &[b"escrow", maker.as_ref(), &123u64.to_le_bytes()],
+        &[b"escrow", maker_pk.as_ref(), &seed.to_le_bytes()],
         &escrowq32026::id(),
     )
     .0;
-    msg!("Escrow PDA: {}\n", escrow);
-
-    // Derive the PDA for the vault associated token account using the escrow PDA and Mint A
     let vault = associated_token::get_associated_token_address(&escrow, &mint_a);
-    msg!("Vault PDA: {}\n", vault);
 
-    // Mint 1,000 tokens (with 6 decimal places) of Mint A to the maker's associated token account
-    MintTo::new(&mut program, &payer, &mint_a, &maker_ata_a, 1000_000_000)
-        .send()
-        .unwrap();
-
-    // Create the "Make" instruction to deposit tokens into the escrow
     let make_ix = Instruction {
         program_id: escrowq32026::id(),
         accounts: escrowq32026::accounts::Make {
-            maker: maker,
-            mint_a: mint_a,
-            mint_b: mint_b,
-            maker_ata_a: maker_ata_a,
-            escrow: escrow,
-            vault: vault,
+            maker: maker_pk,
+            mint_a,
+            mint_b,
+            maker_ata_a,
+            escrow,
+            vault,
             associated_token_program: ASSOCIATED_TOKEN_PROGRAM_ID,
             token_program: TOKEN_PROGRAM_ID,
             system_program: SYSTEM_PROGRAM_ID,
         }
         .to_account_metas(None),
         data: escrowq32026::instruction::Make {
-            deposit: 10_000_000,
-            seed: 123u64,
-            receive: 10_000_000,
-            expiration: 17780206209,
+            deposit,
+            seed,
+            receive,
+            expiration,
         }
         .data(),
     };
 
-    // Create and send the transaction containing the "Make" instruction
-    let message = Message::new(&[make_ix], Some(&payer.pubkey()));
-    let recent_blockhash = program.latest_blockhash();
+    send_ix(svm, make_ix, &[maker]);
+    (escrow, vault)
+}
 
-    let transaction = Transaction::new(&[&payer], message, recent_blockhash);
+#[test]
+fn test_make_and_refund() {
+    let (mut svm, payer) = setup();
+    let maker = payer.pubkey();
 
-    // Send the transaction and capture the result
-    let tx = program.send_transaction(transaction).unwrap();
+    let mint_a = CreateMint::new(&mut svm, &payer)
+        .decimals(6)
+        .authority(&maker)
+        .send()
+        .unwrap();
+    let mint_b = CreateMint::new(&mut svm, &payer)
+        .decimals(6)
+        .authority(&maker)
+        .send()
+        .unwrap();
 
-    // Log transaction details
-    msg!("\n\nMake transaction sucessfull");
-    msg!("CUs Consumed: {}", tx.compute_units_consumed);
-    msg!("Tx Signature: {}", tx.signature);
+    let maker_ata_a = CreateAssociatedTokenAccount::new(&mut svm, &payer, &mint_a)
+        .owner(&maker)
+        .send()
+        .unwrap();
 
-    // Verify the vault account and escrow account data after the "Make" instruction
-    let vault_account = program.get_account(&vault).unwrap();
-    let vault_data = spl_token::state::Account::unpack(&vault_account.data).unwrap();
-    assert_eq!(vault_data.amount, 10_000_000);
+    MintTo::new(&mut svm, &payer, &mint_a, &maker_ata_a, 1000_000_000)
+        .send()
+        .unwrap();
+
+    let (escrow, vault) = make_escrow(
+        &mut svm,
+        &payer,
+        mint_a,
+        mint_b,
+        maker_ata_a,
+        SEED,
+        DEPOSIT,
+        RECEIVE,
+        EXPIRATION,
+    );
+
+    let vault_data =
+        spl_token::state::Account::unpack(&svm.get_account(&vault).unwrap().data).unwrap();
+    assert_eq!(vault_data.amount, DEPOSIT);
     assert_eq!(vault_data.owner, escrow);
     assert_eq!(vault_data.mint, mint_a);
 
-    let escrow_account = program.get_account(&escrow).unwrap();
-    let escrow_data =
-        escrowq32026::state::Escrow::try_deserialize(&mut escrow_account.data.as_ref()).unwrap();
-    assert_eq!(escrow_data.seed, 123u64);
+    let escrow_data = escrowq32026::state::Escrow::try_deserialize(
+        &mut svm.get_account(&escrow).unwrap().data.as_ref(),
+    )
+    .unwrap();
+    assert_eq!(escrow_data.seed, SEED);
     assert_eq!(escrow_data.maker, maker);
     assert_eq!(escrow_data.mint_a, mint_a);
     assert_eq!(escrow_data.mint_b, mint_b);
-    assert_eq!(escrow_data.receive, 10_000_000);
+    assert_eq!(escrow_data.receive, RECEIVE);
 
-    // Create the "Refund" instruction to refund tokens back to the maker
+    msg!("\n\nMake successful — refunding");
+
     let refund_ix = Instruction {
         program_id: escrowq32026::id(),
         accounts: escrowq32026::accounts::Refund {
-            maker: maker,
-            mint_a: mint_a,
-            maker_ata_a: maker_ata_a,
-            escrow: escrow,
-            vault: vault,
+            maker,
+            mint_a,
+            maker_ata_a,
+            escrow,
+            vault,
             token_program: TOKEN_PROGRAM_ID,
             system_program: SYSTEM_PROGRAM_ID,
         }
         .to_account_metas(None),
         data: escrowq32026::instruction::Refund {}.data(),
     };
+    send_ix(&mut svm, refund_ix, &[&payer]);
 
-    // Create and send the transaction containing the "Refund" instruction
-    let message = Message::new(&[refund_ix], Some(&payer.pubkey()));
-    let recent_blockhash = program.latest_blockhash();
+    msg!("\n\nRefund successful");
+    assert!(svm.get_account(&escrow).is_none());
+    assert!(svm.get_account(&vault).is_none());
 
-    let transaction = Transaction::new(&[&payer], message, recent_blockhash);
+    let maker_ata_a_data =
+        spl_token::state::Account::unpack(&svm.get_account(&maker_ata_a).unwrap().data).unwrap();
+    assert_eq!(maker_ata_a_data.amount, 1000_000_000); // full balance restored
+}
 
-    // Send the transaction and capture the result
-    let tx = program.send_transaction(transaction).unwrap();
+#[test]
+fn test_make_update_and_take() {
+    let (mut svm, payer) = setup();
+    let maker_kp = &payer;
+    let maker = maker_kp.pubkey();
+    let taker_kp = Keypair::new();
+    let taker = taker_kp.pubkey();
+    svm.airdrop(&taker, 1_000_000_000).unwrap();
 
-    // Log transaction details
-    msg!("\n\nRefund transaction sucessful");
-    msg!("CUs Consumed: {}", tx.compute_units_consumed);
-    msg!("Tx Signature: {}", tx.signature);
-    assert!(program.get_account(&escrow).is_none());
-    assert!(program.get_account(&vault).is_none());
+    let mint_a = CreateMint::new(&mut svm, maker_kp)
+        .decimals(6)
+        .authority(&maker)
+        .send()
+        .unwrap();
+    let mint_b = CreateMint::new(&mut svm, maker_kp)
+        .decimals(6)
+        .authority(&maker)
+        .send()
+        .unwrap();
+
+    let maker_ata_a = CreateAssociatedTokenAccount::new(&mut svm, maker_kp, &mint_a)
+        .owner(&maker)
+        .send()
+        .unwrap();
+    MintTo::new(&mut svm, maker_kp, &mint_a, &maker_ata_a, 1000_000_000)
+        .send()
+        .unwrap();
+
+    let (escrow, vault) = make_escrow(
+        &mut svm,
+        maker_kp,
+        mint_a,
+        mint_b,
+        maker_ata_a,
+        SEED,
+        DEPOSIT,
+        RECEIVE,
+        EXPIRATION,
+    );
+
+    // --- update: change receive + expiration; vault must stay untouched ---
+    let update_ix = Instruction {
+        program_id: escrowq32026::id(),
+        accounts: escrowq32026::accounts::Update {
+            maker,
+            escrow,
+        }
+        .to_account_metas(None),
+        data: escrowq32026::instruction::Update {
+            receive: NEW_RECEIVE,
+            expiration: NEW_EXPIRATION,
+        }
+        .data(),
+    };
+    send_ix(&mut svm, update_ix, &[maker_kp]);
+
+    let escrow_data = escrowq32026::state::Escrow::try_deserialize(
+        &mut svm.get_account(&escrow).unwrap().data.as_ref(),
+    )
+    .unwrap();
+    assert_eq!(escrow_data.receive, NEW_RECEIVE);
+    assert_eq!(escrow_data.expiration, NEW_EXPIRATION);
+
+    let vault_before =
+        spl_token::state::Account::unpack(&svm.get_account(&vault).unwrap().data).unwrap();
+    assert_eq!(vault_before.amount, DEPOSIT);
+    msg!("\n\nUpdate successful — vault still holds {}", DEPOSIT);
+
+    // --- take: fund taker with mint_b, then complete the swap ---
+    let taker_ata_b = CreateAssociatedTokenAccount::new(&mut svm, &taker_kp, &mint_b)
+        .owner(&taker)
+        .send()
+        .unwrap();
+    MintTo::new(&mut svm, maker_kp, &mint_b, &taker_ata_b, NEW_RECEIVE)
+        .send()
+        .unwrap();
+
+    // init_if_needed destinations — pass derived ATAs (created during take if missing)
+    let taker_ata_a = associated_token::get_associated_token_address(&taker, &mint_a);
+    let maker_ata_b = associated_token::get_associated_token_address(&maker, &mint_b);
+
+    let take_ix = Instruction {
+        program_id: escrowq32026::id(),
+        accounts: escrowq32026::accounts::Take {
+            taker,
+            maker,
+            mint_a,
+            mint_b,
+            taker_ata_a,
+            taker_ata_b,
+            maker_ata_b,
+            escrow,
+            vault,
+            associated_token_program: ASSOCIATED_TOKEN_PROGRAM_ID,
+            token_program: TOKEN_PROGRAM_ID,
+            system_program: SYSTEM_PROGRAM_ID,
+        }
+        .to_account_metas(None),
+        data: escrowq32026::instruction::Take {}.data(),
+    };
+    // taker must sign; maker is only a mutable account for rent
+    send_ix(&mut svm, take_ix, &[&taker_kp]);
+
+    msg!("\n\nTake successful");
+
+    // Escrow + vault closed
+    assert!(svm.get_account(&escrow).is_none());
+    assert!(svm.get_account(&vault).is_none());
+
+    // Taker received mint_a from vault
+    let taker_ata_a_data =
+        spl_token::state::Account::unpack(&svm.get_account(&taker_ata_a).unwrap().data).unwrap();
+    assert_eq!(taker_ata_a_data.amount, DEPOSIT);
+
+    // Maker received the updated mint_b ask
+    let maker_ata_b_data =
+        spl_token::state::Account::unpack(&svm.get_account(&maker_ata_b).unwrap().data).unwrap();
+    assert_eq!(maker_ata_b_data.amount, NEW_RECEIVE);
+
+    // Taker spent all their mint_b
+    let taker_ata_b_data =
+        spl_token::state::Account::unpack(&svm.get_account(&taker_ata_b).unwrap().data).unwrap();
+    assert_eq!(taker_ata_b_data.amount, 0);
 }
